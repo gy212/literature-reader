@@ -15,7 +15,7 @@
 3. **配置Git用户信息**
    ```bash
    git config --global user.name "您的姓名"
-   git config --global user.email "your.email@example.com"
+   git config --global user.email "1164610294@qq.com"
    ```
 
 ## 🚀 初始化Git仓库

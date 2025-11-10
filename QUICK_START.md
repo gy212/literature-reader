@@ -89,36 +89,52 @@ git push origin feature/新功能名称
 - `.gitignore` - Git忽略文件配置
 - `.github/workflows/python.yml` - CI/CD工作流
 
-## 五、下一步
+## 五、启动项目
 
-1. **配置环境变量**
-   - 创建 `.env` 文件
-   - 添加 `OPENAI_API_KEY` 等配置
+### 快速启动
 
-2. **安装依赖**
-   ```bash
-   # 后端
-   pip install -r requirements.txt
-   
-   # 前端
-   cd client
-   npm install
-   ```
+**1. 配置环境变量**
+```bash
+# 复制模板文件
+copy .env.example .env  # Windows
+# 或
+cp .env.example .env    # Linux/Mac
 
-3. **运行项目**
-   ```bash
-   # 后端（终端1）
-   python server/main.py
-   
-   # 前端（终端2）
-   cd client
-   npm run dev
-   ```
+# 编辑 .env 文件，填入API密钥
+```
 
-4. **开始开发**
-   - 查看 `README.md` 了解功能
-   - 查看 `GITHUB_SETUP.md` 了解Git使用
-   - 开始编码！
+**2. 安装依赖**
+```bash
+# 后端依赖
+pip install -r requirements.txt
+
+# 前端依赖
+cd client
+npm install
+cd ..
+```
+
+**3. 启动服务**
+
+**终端1 - 启动后端：**
+```bash
+python server/main.py
+```
+后端运行在：http://localhost:5000
+
+**终端2 - 启动前端：**
+```bash
+cd client
+npm run dev
+```
+前端运行在：http://localhost:3000
+
+**4. 访问应用**
+打开浏览器访问：http://localhost:3000
+
+### 详细启动指南
+
+查看 `START_GUIDE.md` 获取完整的启动说明和故障排除指南。
 
 ## 📚 更多帮助
 

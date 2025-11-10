@@ -21,6 +21,9 @@ export default function PdfViewer({ fileUrl, currentPage = 1, onPageChange, scal
   useEffect(() => {
     if (!fileUrl) return
 
+    let renderTask = null
+    let isCancelled = false
+
     const renderPage = async () => {
       try {
         setLoading(true)
@@ -29,6 +32,9 @@ export default function PdfViewer({ fileUrl, currentPage = 1, onPageChange, scal
         // 加载PDF文档
         const loadingTask = pdfjsLib.getDocument(fileUrl)
         const pdf = await loadingTask.promise
+        
+        if (isCancelled) return
+        
         setTotalPages(pdf.numPages)
 
         // 渲染指定页面
@@ -36,26 +42,45 @@ export default function PdfViewer({ fileUrl, currentPage = 1, onPageChange, scal
         const viewport = page.getViewport({ scale })
 
         const canvas = canvasRef.current
-        if (!canvas) return
+        if (!canvas || isCancelled) return
 
         const ctx = canvas.getContext("2d")
+        
+        // 清除之前的渲染
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+        
         canvas.width = viewport.width
         canvas.height = viewport.height
 
-        await page.render({
+        // 创建渲染任务
+        renderTask = page.render({
           canvasContext: ctx,
           viewport: viewport
-        }).promise
+        })
 
-        setLoading(false)
+        await renderTask.promise
+
+        if (!isCancelled) {
+          setLoading(false)
+        }
       } catch (err) {
-        console.error("PDF渲染错误:", err)
-        setError(err.message)
-        setLoading(false)
+        if (!isCancelled) {
+          console.error("PDF渲染错误:", err)
+          setError(err.message)
+          setLoading(false)
+        }
       }
     }
 
     renderPage()
+
+    // 清理函数：取消渲染任务
+    return () => {
+      isCancelled = true
+      if (renderTask) {
+        renderTask.cancel()
+      }
+    }
   }, [fileUrl, currentPage, scale])
 
   if (error) {
@@ -67,15 +92,15 @@ export default function PdfViewer({ fileUrl, currentPage = 1, onPageChange, scal
   }
 
   return (
-    <div className="relative">
+    <div className="relative inline-block">
       {loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-gray-100 bg-opacity-75">
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-100 bg-opacity-75 z-30">
           <p className="text-gray-600">加载中...</p>
         </div>
       )}
       <canvas
         ref={canvasRef}
-        className="border rounded shadow-sm bg-white"
+        className="border rounded shadow-sm bg-white block"
       />
       {totalPages > 0 && (
         <div className="mt-2 text-sm text-gray-600 text-center">

@@ -15,8 +15,10 @@ QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-turbo
 
 # MinerU API配置
-MINERU_API_URL=https://your-mineru-api-url.com/api/parse
-MINERU_API_KEY=your_mineru_api_key_here
+# 获取方式：访问 https://mineru.net/ 申请Token
+MINERU_TOKEN=your_mineru_token_here
+MINERU_BASE_URL=https://mineru.net/api/v4
+MINERU_MODEL_VERSION=vlm
 MINERU_TIMEOUT=300
 ```
 
@@ -29,9 +31,11 @@ MINERU_TIMEOUT=300
 
 ### 3. 配置MinerU API
 
-根据您的MinerU服务提供商，获取：
-- API地址（`MINERU_API_URL`）
-- API密钥（`MINERU_API_KEY`，如果需要）
+1. 访问 [MinerU官网](https://mineru.net/) 申请Token
+2. 将Token填入 `MINERU_TOKEN`
+3. 可选配置：
+   - `MINERU_MODEL_VERSION`: 模型版本（`vlm` 或 `pipeline`，默认 `vlm`）
+   - `MINERU_TIMEOUT`: 超时时间（秒，默认300）
 
 ## 📝 使用方式
 
@@ -75,11 +79,13 @@ MINERU_API_URL = 'https://api.example.com/parse'
 
 ### MinerU API接口
 
-**端点**: `POST /api/parse-pdf`
+**端点1**: `POST /api/parse-pdf` - 解析PDF文件
 
 **请求**:
-- `file`: PDF文件（multipart/form-data）
-- `use_api`: 是否使用API（默认: true）
+- `file`: PDF文件（multipart/form-data，可选）
+- `file_url`: 文件URL（可选，如果提供则直接使用）
+- `wait`: 是否等待任务完成（默认: true）
+- `model_version`: 模型版本（vlm 或 pipeline，可选）
 
 **响应**:
 ```json
@@ -87,16 +93,67 @@ MINERU_API_URL = 'https://api.example.com/parse'
   "success": true,
   "message": "MinerU API解析成功",
   "data": {
+    "task_id": "xxx",
+    "state": "done",
     "layout_count": 123,
     "layout": [...],
-    "mineru_json": "path/to/file.json"
+    "mineru_data": {...}
+  }
+}
+```
+
+**端点2**: `GET /api/task/<task_id>` - 查询任务状态
+
+**响应**:
+```json
+{
+  "success": true,
+  "message": "查询成功",
+  "data": {
+    "task_id": "xxx",
+    "state": "done/running/pending",
+    "full_zip_url": "https://...",
+    "layout": [...]
   }
 }
 ```
 
 ### 翻译接口
 
-**端点**: `POST /api/translate`
+**端点1**: `POST /api/translate-layout` - 直接翻译layout数组（推荐）
+
+**请求**:
+```json
+{
+  "layout": [
+    {"page": 1, "bbox": [x1, y1, x2, y2], "text": "原文", "type": "text"},
+    ...
+  ],
+  "target_lang": "zh",
+  "model": "qwen-turbo",
+  "force_retranslate": false
+}
+```
+
+**响应**:
+```json
+{
+  "success": true,
+  "message": "翻译完成：成功 123 个，跳过 0 个，失败 0 个",
+  "data": {
+    "layout": [
+      {"page": 1, "bbox": [x1, y1, x2, y2], "text": "原文", "translated_text": "翻译", "type": "text"},
+      ...
+    ],
+    "translated_count": 123,
+    "skipped_count": 0,
+    "failed_count": 0,
+    "total_count": 123
+  }
+}
+```
+
+**端点2**: `POST /api/translate` - 翻译MinerU JSON文件
 
 **请求**:
 - `filename`: JSON文件名
@@ -114,6 +171,8 @@ MINERU_API_URL = 'https://api.example.com/parse'
   }
 }
 ```
+
+**注意**: 翻译功能默认使用通义千问API（如果配置了`QWEN_API_KEY`），否则使用OpenAI兼容API。
 
 ## 🔍 测试配置
 

@@ -30,9 +30,10 @@ class Config:
     DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', QWEN_MODEL)
     
     # MinerU API配置
-    MINERU_API_URL = os.environ.get('MINERU_API_URL', '')
-    MINERU_API_KEY = os.environ.get('MINERU_API_KEY', '')
+    MINERU_TOKEN = os.environ.get('MINERU_TOKEN', '')  # MinerU API Token
+    MINERU_BASE_URL = os.environ.get('MINERU_BASE_URL', 'https://mineru.net/api/v4')
     MINERU_TIMEOUT = int(os.environ.get('MINERU_TIMEOUT', '300'))  # 5分钟超时
+    MINERU_MODEL_VERSION = os.environ.get('MINERU_MODEL_VERSION', 'vlm')  # pipeline 或 vlm
     
     # 翻译目标语言
     DEFAULT_TARGET_LANG = 'zh'

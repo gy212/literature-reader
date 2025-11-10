@@ -8,7 +8,16 @@ from pathlib import Path
 from flask import Blueprint, request, jsonify, send_from_directory, current_app
 from werkzeug.utils import secure_filename
 from server.mineru_parser import parse_mineru_layout
-from server.mineru_api import call_mineru_api, parse_mineru_api_response
+from server.mineru_api import (
+    create_extract_task, 
+    get_task_result, 
+    get_batch_task_result,
+    wait_for_task_completion,
+    get_file_upload_urls,
+    upload_file_to_url,
+    parse_pdf_with_mineru_api,
+    download_and_extract_zip
+)
 from server.translator_llm import translate_mineru_json
 
 logger = logging.getLogger(__name__)
@@ -116,25 +125,30 @@ def parse_pdf_with_api():
     通过MinerU API解析PDF文件
     
     请求参数:
-        - filename: PDF文件名（可选，从上传的文件中获取）
-        - file: 上传的PDF文件（可选）
-        - use_api: 是否使用API（默认: true）
+        - file: 上传的PDF文件
+        - file_url: 文件URL（可选，如果提供则直接使用，否则先上传）
+        - wait: 是否等待任务完成（默认: true）
+        - model_version: 模型版本（vlm 或 pipeline，默认从配置读取）
     
     返回:
         {
             "success": true/false,
             "message": "...",
             "data": {
-                "layout_count": 123,
+                "task_id": "...",
+                "state": "done/pending/running",
                 "layout": [...],
                 "mineru_data": {...}
             }
         }
     """
     try:
+        file_url = request.form.get('file_url')
+        wait_for_completion = request.form.get('wait', 'true').lower() == 'true'
+        model_version = request.form.get('model_version')
+        
         pdf_path = None
-        filename = request.form.get('filename')
-        use_api = request.form.get('use_api', 'true').lower() == 'true'
+        filename = None
         
         # 如果上传了新文件
         if 'file' in request.files:
@@ -145,57 +159,414 @@ def parse_pdf_with_api():
                 pdf_path = upload_folder / filename
                 file.save(str(pdf_path))
         
-        # 如果指定了文件名，从files文件夹读取
-        elif filename:
-            upload_folder = Path(current_app.config['UPLOAD_FOLDER'])
-            pdf_path = upload_folder / secure_filename(filename)
-        
-        if not pdf_path or not pdf_path.exists():
-            return get_standard_response(False, "PDF文件未找到", {}), 404
-        
-        # 使用MinerU API解析
-        if use_api:
-            mineru_api_url = current_app.config.get('MINERU_API_URL', '')
-            if not mineru_api_url:
+        # 如果没有提供file_url，使用批量上传接口
+        if not file_url:
+            if not pdf_path or not pdf_path.exists():
+                return get_standard_response(False, "请提供file_url或上传PDF文件", {}), 400
+            
+            # 使用批量上传接口获取上传URL
+            try:
+                files_data = [{"name": filename}]
+                upload_info = get_file_upload_urls(files_data, model_version)
+                upload_urls = upload_info.get('file_urls', [])
+                batch_id = upload_info.get('batch_id')
+                
+                if not upload_urls:
+                    return get_standard_response(False, "未获取到上传URL", {}), 500
+                
+                # 上传文件
+                upload_file_to_url(str(pdf_path), upload_urls[0])
+                
+                # 注意：使用批量上传后，系统会自动提交解析任务
+                # 需要查询batch_id的结果
                 return get_standard_response(
-                    False, 
-                    "未配置MINERU_API_URL，请在环境变量中设置", 
-                    {}
-                ), 400
-            
-            # 调用MinerU API
-            mineru_data = call_mineru_api(str(pdf_path))
-            
-            # 解析layout
-            layout = parse_mineru_api_response(mineru_data)
-            
-            # 保存MinerU返回的JSON（可选）
-            mineru_folder = Path(current_app.config['MINERU_FOLDER'])
-            json_filename = filename.replace('.pdf', '.json')
-            json_path = mineru_folder / json_filename
-            json_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(mineru_data, f, ensure_ascii=False, indent=2)
-            
-            return get_standard_response(
-                True,
-                "MinerU API解析成功",
-                {
-                    "layout_count": len(layout),
-                    "layout": layout,
-                    "mineru_json": str(json_path),
-                    "mineru_data": mineru_data
-                }
+                    True,
+                    "文件已上传，系统将自动提交解析任务",
+                    {
+                        "batch_id": batch_id,
+                        "state": "waiting-file",
+                        "message": "请使用batch_id查询解析结果"
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"文件上传失败: {e}", exc_info=True)
+                return get_standard_response(False, f"文件上传失败: {str(e)}", {}), 500
+        
+        # 如果有file_url，直接创建解析任务
+        try:
+            result = parse_pdf_with_mineru_api(
+                file_path=str(pdf_path) if pdf_path else '',
+                file_url=file_url,
+                wait_for_completion=wait_for_completion,
+                model_version=model_version
             )
-        else:
-            # 使用本地文件解析（兼容旧方式）
-            return get_standard_response(False, "请使用use_api=true调用API", {}), 400
+            
+            if result.get('state') == 'done':
+                # 解析layout
+                mineru_data = result.get('mineru_data', {})
+                layout = parse_mineru_layout_from_data(mineru_data)
+                
+                return get_standard_response(
+                    True,
+                    "MinerU API解析成功",
+                    {
+                        "task_id": result.get('task_id'),
+                        "layout_count": len(layout),
+                        "layout": layout,
+                        "mineru_data": mineru_data,
+                        "json_path": result.get('json_path')
+                    }
+                )
+            else:
+                return get_standard_response(
+                    True,
+                    "任务已提交",
+                    result
+                )
+                
+        except Exception as e:
+            logger.error(f"MinerU API调用失败: {e}", exc_info=True)
+            return get_standard_response(False, f"解析失败: {str(e)}", {}), 500
         
     except FileNotFoundError:
         return get_standard_response(False, "文件未找到", {}), 404
     except Exception as e:
         logger.error(f"解析失败: {e}", exc_info=True)
         return get_standard_response(False, f"解析失败: {str(e)}", {}), 500
+
+
+def parse_mineru_layout_from_data(mineru_data: dict) -> list:
+    """
+    从MinerU JSON数据中解析layout
+    
+    支持多种格式：
+    1. layout.json格式：{"pdf_info": [{"para_blocks": [...], "page_idx": 0}, ...]}
+    2. content_list.json格式：[{"text": "...", "bbox": [...], "page_idx": 0}, ...]
+    3. model.json格式：[[{"type": "...", "content": "...", "bbox": [...]}, ...], ...]
+    4. 旧格式：{"pages": [{"blocks": [...], "page_no": 1}, ...]}
+    
+    Args:
+        mineru_data: MinerU返回的JSON数据
+    
+    Returns:
+        包含页面、位置和文本的列表，格式：[{"page": 1, "bbox": [x1, y1, x2, y2], "text": "...", "type": "text/title"}, ...]
+    """
+    layout = []
+    
+    try:
+        if not mineru_data:
+            logger.warning("mineru_data为空")
+            return layout
+        
+        # 格式1: layout.json格式 - {"pdf_info": [...]}
+        if "pdf_info" in mineru_data:
+            logger.info("检测到layout.json格式（pdf_info）")
+            pdf_info = mineru_data.get("pdf_info", [])
+            logger.info(f"开始解析，共 {len(pdf_info)} 页")
+            
+            for page_data in pdf_info:
+                # 获取页码（page_idx从0开始，前端需要从1开始）
+                page_idx = page_data.get("page_idx", 0)
+                page_no = page_idx + 1
+                
+                # 获取段落块
+                para_blocks = page_data.get("para_blocks", [])
+                if not para_blocks:
+                    logger.debug(f"第{page_no}页没有para_blocks")
+                    continue
+                
+                logger.debug(f"第{page_no}页有 {len(para_blocks)} 个段落块")
+                
+                # 遍历段落块
+                for block in para_blocks:
+                    block_type = block.get("type", "")
+                    
+                    # 只处理text和title类型的块
+                    if block_type not in ["text", "title"]:
+                        continue
+                    
+                    # 获取bbox
+                    bbox = block.get("bbox", [])
+                    if not bbox or len(bbox) < 4:
+                        continue
+                    
+                    # 从lines -> spans -> content中提取文本
+                    lines = block.get("lines", [])
+                    text_parts = []
+                    
+                    for line in lines:
+                        if not isinstance(line, dict):
+                            continue
+                        
+                        spans = line.get("spans", [])
+                        for span in spans:
+                            if isinstance(span, dict):
+                                content = span.get("content", "")
+                                if content:
+                                    text_parts.append(content)
+                    
+                    # 合并文本
+                    text = " ".join(text_parts).strip()
+                    
+                    if text:  # 只添加非空文本块
+                        layout.append({
+                            "page": page_no,
+                            "bbox": bbox,
+                            "text": text,
+                            "type": block_type
+                        })
+                        logger.debug(f"添加{block_type}块: 第{page_no}页, 文本长度: {len(text)}")
+            
+            logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
+            return layout
+        
+        # 格式2: content_list.json格式 - [{"text": "...", "bbox": [...], "page_idx": 0}, ...]
+        if isinstance(mineru_data, list) and len(mineru_data) > 0:
+            first_item = mineru_data[0]
+            if isinstance(first_item, dict) and "text" in first_item and "page_idx" in first_item:
+                logger.info("检测到content_list.json格式")
+                logger.info(f"开始解析，共 {len(mineru_data)} 个文本块")
+                
+                for item in mineru_data:
+                    text = item.get("text", "").strip()
+                    if not text:
+                        continue
+                    
+                    bbox = item.get("bbox", [])
+                    if not bbox or len(bbox) < 4:
+                        continue
+                    
+                    page_idx = item.get("page_idx", 0)
+                    page_no = page_idx + 1
+                    
+                    block_type = item.get("type", "text")
+                    if item.get("text_level") == 1:
+                        block_type = "title"
+                    
+                    layout.append({
+                        "page": page_no,
+                        "bbox": bbox,
+                        "text": text,
+                        "type": block_type
+                    })
+                
+                logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
+                return layout
+            
+            # 格式3: model.json格式 - [[{...}, ...], ...] (二维数组，第一维是页面)
+            if isinstance(first_item, list):
+                logger.info("检测到model.json格式（二维数组）")
+                logger.info(f"开始解析，共 {len(mineru_data)} 页")
+                
+                for page_idx, page_blocks in enumerate(mineru_data):
+                    page_no = page_idx + 1
+                    
+                    if not isinstance(page_blocks, list):
+                        continue
+                    
+                    for block in page_blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        
+                        content = block.get("content", "").strip()
+                        if not content:
+                            continue
+                        
+                        bbox = block.get("bbox", [])
+                        if not bbox or len(bbox) < 4:
+                            continue
+                        
+                        # model.json中的bbox是相对坐标(0-1)，需要转换为像素坐标
+                        # 但这里我们不知道页面尺寸，所以先保持原样
+                        # 前端可能需要根据实际页面尺寸进行转换
+                        block_type = block.get("type", "text")
+                        
+                        layout.append({
+                            "page": page_no,
+                            "bbox": bbox,
+                            "text": content,
+                            "type": block_type
+                        })
+                
+                logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
+                return layout
+        
+        # 格式4: 旧格式 - {"pages": [...]}
+        pages = mineru_data.get("pages", [])
+        if pages:
+            logger.info("检测到旧格式（pages）")
+            logger.info(f"开始解析，共 {len(pages)} 页")
+            
+            for page_idx, page in enumerate(pages):
+                # 支持多种页码字段名
+                page_no = page.get("page_no") or page.get("page") or page.get("pageNo") or page.get("page_idx", 0) + 1
+                
+                blocks = page.get("blocks", [])
+                if not blocks:
+                    logger.debug(f"第{page_no}页没有blocks")
+                    continue
+                
+                logger.debug(f"第{page_no}页有 {len(blocks)} 个块")
+                
+                # 遍历页面中的所有块
+                for block_idx, block in enumerate(blocks):
+                    block_type = block.get("type", "")
+                    
+                    if block_type in ["text", "title"]:
+                        # 合并所有行的文本
+                        lines = block.get("lines", [])
+                        if not lines:
+                            logger.debug(f"第{page_no}页第{block_idx}个文本块没有lines")
+                            continue
+                        
+                        text_parts = []
+                        for line in lines:
+                            if isinstance(line, dict):
+                                line_text = line.get("text", "") or line.get("content", "")
+                                if line_text:
+                                    text_parts.append(line_text)
+                        
+                        text = " ".join(text_parts).strip()
+                        
+                        if text:  # 只添加非空文本块
+                            bbox = block.get("bbox") or block.get("bbox_coords") or [0, 0, 0, 0]
+                            layout.append({
+                                "page": page_no,
+                                "bbox": bbox,
+                                "text": text,
+                                "type": block_type
+                            })
+                            logger.debug(f"添加文本块: 第{page_no}页, 文本长度: {len(text)}")
+            
+            logger.info(f"解析完成，共提取 {len(layout)} 个文本块")
+            return layout
+        
+        # 如果都不匹配，记录警告
+        logger.warning("未识别到支持的MinerU数据格式")
+        logger.debug(f"mineru_data keys/type: {list(mineru_data.keys()) if isinstance(mineru_data, dict) else type(mineru_data)}")
+        logger.debug(f"示例数据: {json.dumps(mineru_data if isinstance(mineru_data, dict) else (mineru_data[0] if isinstance(mineru_data, list) and len(mineru_data) > 0 else {}), ensure_ascii=False, indent=2)[:1000]}")
+        
+        return layout
+        
+    except Exception as e:
+        logger.error(f"解析MinerU数据失败: {e}", exc_info=True)
+        return []
+
+
+@api_bp.route('/task/<task_id>', methods=['GET'])
+def get_mineru_task(task_id: str):
+    """
+    查询MinerU解析任务状态
+    
+    Args:
+        task_id: 任务ID
+    
+    返回:
+        任务状态和结果
+    """
+    try:
+        result = get_task_result(task_id)
+        
+        # 如果任务完成，尝试解析layout
+        if result.get('state') == 'done':
+            zip_url = result.get('full_zip_url')
+            if zip_url:
+                try:
+                    extract_dir = Path(current_app.config['MINERU_FOLDER']) / task_id
+                    zip_info = download_and_extract_zip(zip_url, extract_dir)
+                    
+                    # 读取JSON文件
+                    json_path = zip_info['json_path']
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        mineru_data = json.load(f)
+                    
+                    layout = parse_mineru_layout_from_data(mineru_data)
+                    
+                    result['mineru_data'] = mineru_data
+                    result['layout'] = layout
+                    result['layout_count'] = len(layout)
+                    result['json_path'] = json_path
+                    result['extract_dir'] = zip_info.get('extract_dir')
+                    result['full_md_path'] = zip_info.get('full_md_path')
+                    result['images_dir'] = zip_info.get('images_dir')
+                except Exception as e:
+                    logger.warning(f"下载结果失败: {e}")
+        
+        return get_standard_response(True, "查询成功", result)
+        
+    except Exception as e:
+        logger.error(f"查询任务失败: {e}", exc_info=True)
+        return get_standard_response(False, f"查询失败: {str(e)}", {}), 500
+
+
+@api_bp.route('/batch/<batch_id>', methods=['GET'])
+def get_mineru_batch(batch_id: str):
+    """
+    查询MinerU批量解析任务状态
+    
+    Args:
+        batch_id: 批量任务ID
+    
+    返回:
+        批量任务状态和结果
+    """
+    try:
+        result = get_batch_task_result(batch_id)
+        
+        # 处理批量结果
+        extract_results = result.get('extract_result', [])
+        if extract_results:
+            # 取第一个结果（通常只有一个文件）
+            first_result = extract_results[0]
+            state = first_result.get('state', '')
+            
+            # 如果任务完成，尝试解析layout
+            if state == 'done':
+                zip_url = first_result.get('full_zip_url')
+                if zip_url:
+                    try:
+                        extract_dir = Path(current_app.config['MINERU_FOLDER']) / batch_id
+                        zip_info = download_and_extract_zip(zip_url, extract_dir)
+                        
+                        # 读取JSON文件
+                        json_path = zip_info['json_path']
+                        with open(json_path, 'r', encoding='utf-8') as f:
+                            mineru_data = json.load(f)
+                        
+                        layout = parse_mineru_layout_from_data(mineru_data)
+                        
+                        first_result['mineru_data'] = mineru_data
+                        first_result['layout'] = layout
+                        first_result['layout_count'] = len(layout)
+                        first_result['json_path'] = json_path
+                        first_result['extract_dir'] = zip_info.get('extract_dir')
+                        first_result['full_md_path'] = zip_info.get('full_md_path')
+                        first_result['images_dir'] = zip_info.get('images_dir')
+                    except Exception as e:
+                        logger.warning(f"下载结果失败: {e}")
+            
+            # 返回第一个结果的状态和进度信息
+            return get_standard_response(True, "查询成功", {
+                "batch_id": batch_id,
+                "state": state,
+                "file_name": first_result.get('file_name', ''),
+                "err_msg": first_result.get('err_msg', ''),
+                "extract_progress": first_result.get('extract_progress', {}),
+                "layout": first_result.get('layout', []),
+                "layout_count": first_result.get('layout_count', 0),
+                "mineru_data": first_result.get('mineru_data')
+            })
+        else:
+            return get_standard_response(True, "查询成功", {
+                "batch_id": batch_id,
+                "state": "pending",
+                "message": "任务处理中"
+            })
+        
+    except Exception as e:
+        logger.error(f"查询批量任务失败: {e}", exc_info=True)
+        return get_standard_response(False, f"查询失败: {str(e)}", {}), 500
 
 
 @api_bp.route('/layout', methods=['POST'])
@@ -259,6 +630,188 @@ def parse_layout():
     except Exception as e:
         logger.error(f"解析失败: {e}", exc_info=True)
         return get_standard_response(False, f"解析失败: {str(e)}", {}), 500
+
+
+@api_bp.route('/translate-layout', methods=['POST'])
+def translate_layout():
+    """
+    直接翻译layout数组中的文本块
+    
+    请求参数:
+        - layout: JSON格式的layout数组
+        - target_lang: 目标语言（默认: zh）
+        - model: 使用的模型（可选）
+    
+    返回:
+        {
+            "success": true/false,
+            "message": "...",
+            "data": {
+                "layout": [...],  # 包含translated_text的layout数组
+                "translated_count": 123
+            }
+        }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return get_standard_response(False, "请求数据为空", {}), 400
+        
+        layout = data.get('layout', [])
+        if not layout:
+            return get_standard_response(False, "layout数据为空", {}), 400
+        
+        target_lang = data.get('target_lang', current_app.config.get('DEFAULT_TARGET_LANG', 'zh'))
+        model = data.get('model')
+        force_retranslate = data.get('force_retranslate', False)  # 是否强制重新翻译
+        
+        from server.translator_llm import translate_with_llm
+        
+        # 检查是否配置了通义千问
+        qwen_api_key = current_app.config.get('QWEN_API_KEY', '')
+        if qwen_api_key:
+            logger.info("翻译服务：使用通义千问API")
+        else:
+            logger.warning("翻译服务：未配置QWEN_API_KEY，将尝试使用OPENAI_API_KEY")
+        
+        translated_count = 0
+        skipped_count = 0
+        failed_count = 0
+        total_count = len(layout)
+        first_error = None  # 记录第一个错误详情
+        
+        logger.info(f"开始翻译 {total_count} 个文本块，目标语言: {target_lang}, 强制重新翻译: {force_retranslate}")
+        
+        # 翻译每个文本块
+        for idx, block in enumerate(layout):
+            text = block.get('text', '').strip()
+            if not text:
+                continue
+            
+            # 如果已有翻译且不强制重新翻译，则跳过
+            if not force_retranslate and block.get('translated_text'):
+                skipped_count += 1
+                continue
+            
+            try:
+                import time
+                block_start_time = time.time()
+                logger.info(f"=" * 60)
+                logger.info(f"开始翻译文本块 [{idx+1}/{total_count}]")
+                logger.info(f"文本内容预览: {text[:100]}...")
+                logger.info(f"文本块长度: {len(text)} 字符，目标语言: {target_lang}")
+                logger.info(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # 调用大模型进行翻译
+                logger.info(f"准备调用 translate_with_llm 函数...")
+                translated_text = translate_with_llm(text, target_lang=target_lang, model=model)
+                block_elapsed = time.time() - block_start_time
+                logger.info(f"文本块 [{idx+1}] 翻译完成，耗时: {block_elapsed:.2f}秒")
+                
+                # 检查翻译结果是否与原文相同（可能是错误）
+                if translated_text == text and len(text) > 10:
+                    logger.warning(f"⚠️ 翻译结果与原文相同，可能大模型未进行翻译: {text[:100]}...")
+                else:
+                    logger.info(f"✅ 文本块 [{idx+1}] 翻译成功")
+                
+                block['translated_text'] = translated_text
+                translated_count += 1
+                
+                # 每翻译1个文本块就记录一次进度（确保能看到进度）
+                logger.info(f"📊 当前进度: {translated_count}/{total_count} ({translated_count*100//total_count}%)")
+                
+                # 每翻译10个文本块记录一次详细进度
+                if translated_count % 10 == 0:
+                    logger.info(f"🎯 里程碑进度: {translated_count}/{total_count} ({translated_count*100//total_count}%)")
+                    
+            except Exception as e:
+                import time
+                error_msg = str(e)
+                logger.error(f"❌ 翻译文本块失败 [{idx+1}/{total_count}]")
+                logger.error(f"错误信息: {error_msg}")
+                logger.error(f"错误类型: {type(e).__name__}")
+                failed_count += 1
+                
+                # 记录第一个失败的错误详情，用于返回给前端
+                if failed_count == 1:
+                    first_error = error_msg
+                    logger.error(f"🔴 第一个翻译失败的错误详情: {error_msg}", exc_info=True)
+                    import traceback
+                    logger.error(f"完整错误堆栈:\n{traceback.format_exc()}")
+                    logger.error(f"失败时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # 失败时保留原文或已有翻译
+                if not block.get('translated_text'):
+                    block['translated_text'] = text
+        
+        logger.info(f"翻译完成: 成功 {translated_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个，总计 {total_count} 个文本块")
+        
+        # 如果有失败，提供更详细的错误信息
+        message = f"翻译完成：成功 {translated_count} 个"
+        if skipped_count > 0:
+            message += f"，跳过 {skipped_count} 个"
+        if failed_count > 0:
+            message += f"，失败 {failed_count} 个"
+            
+            # 检查是否是因为API配置问题
+            qwen_api_key = current_app.config.get('QWEN_API_KEY', '')
+            openai_api_key = current_app.config.get('OPENAI_API_KEY', '')
+            
+            if not qwen_api_key and not openai_api_key:
+                message += "（未配置API密钥，请设置QWEN_API_KEY或OPENAI_API_KEY）"
+            elif first_error:
+                # 分析第一个错误
+                if "API密钥" in first_error or "401" in first_error or "Unauthorized" in first_error:
+                    message += "（API密钥无效，请检查配置）"
+                elif "429" in first_error or "rate limit" in first_error.lower():
+                    message += "（API调用频率超限，请稍后重试）"
+                elif "timeout" in first_error.lower():
+                    message += "（API调用超时，请检查网络）"
+                elif "model" in first_error.lower() and "not found" in first_error.lower():
+                    message += "（模型不存在，请检查模型配置）"
+                else:
+                    message += f"（错误: {first_error[:100]}...）"
+        
+        response_data = {
+            "layout": layout,
+            "translated_count": translated_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "total_count": total_count
+        }
+        
+        # 如果有错误，添加错误详情
+        if first_error:
+            response_data["first_error"] = first_error
+            response_data["error_summary"] = {
+                "api_configured": bool(qwen_api_key or openai_api_key),
+                "qwen_configured": bool(qwen_api_key),
+                "openai_configured": bool(openai_api_key)
+            }
+        
+        return get_standard_response(
+            True,
+            message,
+            response_data
+        )
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"翻译layout失败: {error_msg}", exc_info=True)
+        
+        # 提供更友好的错误信息
+        if "API密钥" in error_msg or "QWEN_API_KEY" in error_msg:
+            friendly_msg = "翻译失败：请检查通义千问API密钥配置（QWEN_API_KEY）"
+        elif "rate limit" in error_msg.lower() or "429" in error_msg:
+            friendly_msg = "翻译失败：API调用频率超限，请稍后重试"
+        elif "timeout" in error_msg.lower():
+            friendly_msg = "翻译失败：API调用超时，请检查网络连接"
+        else:
+            friendly_msg = f"翻译失败: {error_msg}"
+        
+        return get_standard_response(False, friendly_msg, {
+            "error_detail": error_msg
+        }), 500
 
 
 @api_bp.route('/translate', methods=['POST'])
@@ -335,10 +888,21 @@ def get_file(filename):
         filename: 文件名
     """
     try:
-        upload_folder = current_app.config['UPLOAD_FOLDER']
-        return send_from_directory(upload_folder, filename)
+        upload_folder = Path(current_app.config['UPLOAD_FOLDER'])
+        file_path = upload_folder / filename
+        
+        # 检查文件是否存在
+        if not file_path.exists():
+            logger.error(f"文件不存在: {file_path}")
+            return get_standard_response(False, f"文件不存在: {filename}", {}), 404
+        
+        # 确保路径是绝对路径
+        upload_folder = upload_folder.resolve()
+        
+        logger.debug(f"返回文件: {upload_folder} / {filename}")
+        return send_from_directory(str(upload_folder), filename)
     except Exception as e:
-        logger.error(f"获取文件失败: {e}")
+        logger.error(f"获取文件失败: {e}", exc_info=True)
         return get_standard_response(False, f"文件不存在: {filename}", {}), 404
 
 
@@ -348,12 +912,95 @@ def get_mineru_file(filename):
     获取MinerU输出文件
     
     Args:
-        filename: 文件名
+        filename: 文件名（可以是相对路径，如 task_id/full.md 或 task_id/images/image.jpg）
     """
     try:
-        mineru_folder = current_app.config['MINERU_FOLDER']
-        return send_from_directory(mineru_folder, filename)
+        mineru_folder = Path(current_app.config['MINERU_FOLDER'])
+        file_path = mineru_folder / filename
+        
+        # 安全检查：确保文件在mineru文件夹内
+        if not str(file_path.resolve()).startswith(str(mineru_folder.resolve())):
+            return get_standard_response(False, "非法路径", {}), 403
+        
+        if not file_path.exists():
+            return get_standard_response(False, f"文件不存在: {filename}", {}), 404
+        
+        # 如果是目录，返回错误
+        if file_path.is_dir():
+            return get_standard_response(False, "路径是目录", {}), 400
+        
+        return send_from_directory(str(file_path.parent), file_path.name)
     except Exception as e:
-        logger.error(f"获取文件失败: {e}")
+        logger.error(f"获取文件失败: {e}", exc_info=True)
         return get_standard_response(False, f"文件不存在: {filename}", {}), 404
+
+
+@api_bp.route('/full-text/<task_id>', methods=['GET'])
+def get_full_text(task_id: str):
+    """
+    获取MinerU解析的全文Markdown内容
+    
+    Args:
+        task_id: 任务ID或batch_id
+    """
+    try:
+        mineru_folder = Path(current_app.config['MINERU_FOLDER'])
+        
+        # 尝试查找full.md文件
+        md_path = mineru_folder / task_id / 'full.md'
+        
+        if md_path.exists():
+            with open(md_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            return get_standard_response(True, "获取成功", {
+                "content": content,
+                "path": str(md_path)
+            })
+        
+        # 如果直接路径不存在，尝试递归查找
+        task_dir = mineru_folder / task_id
+        if task_dir.exists():
+            md_files = list(task_dir.rglob('full.md'))
+            if md_files:
+                md_path = md_files[0]
+                with open(md_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                return get_standard_response(True, "获取成功", {
+                    "content": content,
+                    "path": str(md_path)
+                })
+        
+        return get_standard_response(False, "未找到full.md文件", {}), 404
+        
+    except Exception as e:
+        logger.error(f"获取全文失败: {e}", exc_info=True)
+        return get_standard_response(False, f"获取失败: {str(e)}", {}), 500
+
+
+@api_bp.route('/images/<task_id>/<path:image_name>', methods=['GET'])
+def get_image(task_id: str, image_name: str):
+    """
+    获取MinerU解析的图片
+    
+    Args:
+        task_id: 任务ID或batch_id
+        image_name: 图片文件名
+    """
+    try:
+        mineru_folder = Path(current_app.config['MINERU_FOLDER'])
+        image_path = mineru_folder / task_id / 'images' / image_name
+        
+        # 安全检查
+        if not str(image_path.resolve()).startswith(str(mineru_folder.resolve())):
+            return get_standard_response(False, "非法路径", {}), 403
+        
+        if not image_path.exists():
+            return get_standard_response(False, f"图片不存在: {image_name}", {}), 404
+        
+        return send_from_directory(str(image_path.parent), image_path.name)
+    except Exception as e:
+        logger.error(f"获取图片失败: {e}", exc_info=True)
+        return get_standard_response(False, f"图片不存在: {image_name}", {}), 404
 

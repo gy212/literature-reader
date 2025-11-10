@@ -26,11 +26,15 @@ def create_app(config_name='default'):
     # 初始化缓存
     cache.init_app(app)
     
-    # 创建必要的目录
-    upload_folder = Path(app.config['UPLOAD_FOLDER'])
-    mineru_folder = Path(app.config['MINERU_FOLDER'])
+    # 创建必要的目录（使用绝对路径）
+    upload_folder = Path(app.config['UPLOAD_FOLDER']).resolve()
+    mineru_folder = Path(app.config['MINERU_FOLDER']).resolve()
     upload_folder.mkdir(parents=True, exist_ok=True)
     mineru_folder.mkdir(parents=True, exist_ok=True)
+    
+    # 更新配置为绝对路径
+    app.config['UPLOAD_FOLDER'] = str(upload_folder)
+    app.config['MINERU_FOLDER'] = str(mineru_folder)
     
     # 配置日志
     logging.basicConfig(

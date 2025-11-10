@@ -10,35 +10,40 @@ export default function BlockText({ block, mode = "both" }) {
   const originalText = block.text || ""
   const translatedText = block.translated_text || ""
 
-  let displayText = ""
-
-  switch (mode) {
-    case "original":
-      displayText = originalText
-      break
-    case "translated":
-      displayText = translatedText || originalText
-      break
-    case "both":
-      if (translatedText) {
-        displayText = `${originalText}\n\n---\n\n${translatedText}`
-      } else {
-        displayText = originalText
-      }
-      break
-    default:
-      displayText = originalText
-  }
-
   return (
-    <div className="p-4 bg-white rounded-lg shadow-sm border border-gray-200 my-2">
-      <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
-        {displayText}
-      </p>
-      {mode === "both" && translatedText && (
-        <div className="mt-2 pt-2 border-t border-gray-200">
-          <span className="text-xs text-gray-500">原文</span>
-          <p className="text-sm text-gray-600 mt-1">{originalText}</p>
+    <div className="p-3 bg-gray-50 rounded-lg border border-gray-200 my-2 hover:bg-gray-100 transition-colors">
+      {mode === "original" && (
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+          {originalText}
+        </p>
+      )}
+      {mode === "translated" && (
+        <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+          {translatedText || originalText}
+        </p>
+      )}
+      {mode === "both" && (
+        <div>
+          {translatedText ? (
+            <>
+              <div className="mb-3">
+                <div className="text-xs font-semibold text-gray-500 mb-1">原文</div>
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+                  {originalText}
+                </p>
+              </div>
+              <div className="pt-3 border-t border-gray-300">
+                <div className="text-xs font-semibold text-gray-500 mb-1">翻译</div>
+                <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+                  {translatedText}
+                </p>
+              </div>
+            </>
+          ) : (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed text-gray-800">
+              {originalText}
+            </p>
+          )}
         </div>
       )}
     </div>
